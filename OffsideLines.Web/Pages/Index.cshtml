@@ -1,0 +1,577 @@
+@page
+@model IndexModel
+@{
+    ViewData["Title"] = "Offside Lines";
+    Layout = "_Layout";
+}
+
+<style>
+    #app {
+        display: flex;
+        flex-direction: column;
+        height: calc(100vh - 60px);
+        overflow: hidden;
+    }
+    #toolbar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        background: #1e1e2e;
+        color: #cdd6f4;
+        flex-wrap: wrap;
+        flex-shrink: 0;
+    }
+    #toolbar .sep { width: 1px; height: 28px; background: #45475a; margin: 0 4px; }
+    #toolbar button {
+        padding: 5px 12px;
+        border-radius: 6px;
+        border: 1px solid #45475a;
+        background: #313244;
+        color: #cdd6f4;
+        cursor: pointer;
+        font-size: 13px;
+        white-space: nowrap;
+    }
+    #toolbar button:hover { background: #45475a; }
+    #toolbar button:disabled { opacity: 0.4; cursor: not-allowed; }
+    #toolbar button.active { background: #89b4fa; color: #1e1e2e; border-color: #89b4fa; }
+    #toolbar button.team-a.active { background: #FFD700; color: #1e1e2e; border-color: #FFD700; }
+    #toolbar button.team-b.active { background: #FF4444; color: #fff; border-color: #FF4444; }
+    #toolbar button.project.active { background: #f9a825; color: #1e1e2e; border-color: #f9a825; }
+    #status {
+        padding: 6px 12px;
+        background: #181825;
+        color: #a6e3a1;
+        font-size: 13px;
+        flex-shrink: 0;
+        border-bottom: 1px solid #313244;
+        min-height: 30px;
+    }
+    #canvas-wrap {
+        flex: 1;
+        overflow: auto;
+        display: flex;
+        align-items: flex-start;
+        justify-content: center;
+        background: #11111b;
+        padding: 12px;
+    }
+    #canvas {
+        display: block;
+        cursor: crosshair;
+        max-width: 100%;
+    }
+    #canvas.no-image { cursor: default; }
+</style>
+
+<div id="app">
+    <div id="toolbar">
+        <button id="btn-load">📂 Load Image</button>
+        <input type="file" id="file-input" accept="image/*" style="display:none">
+        <div class="sep"></div>
+        <button id="btn-ref1" disabled>① Ref Line 1</button>
+        <button id="btn-ref2" disabled>② Ref Line 2</button>
+        <div class="sep"></div>
+        <button id="btn-team-a" class="team-a" disabled>Team A</button>
+        <button id="btn-team-b" class="team-b" disabled>Team B</button>
+        <button id="btn-project" class="project" disabled title="Draw two intersecting lines to project a body part onto the pitch">📐 Project</button>
+        <div class="sep"></div>
+        <button id="btn-undo" disabled>↩ Undo</button>
+        <button id="btn-reset-refs" disabled>Reset Refs</button>
+        <button id="btn-download" disabled>⬇ Download</button>
+    </div>
+    <div id="status">Load an image to begin.</div>
+    <div id="canvas-wrap">
+        <canvas id="canvas" class="no-image"></canvas>
+    </div>
+</div>
+
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const status = document.getElementById('status');
+
+const btnLoad       = document.getElementById('btn-load');
+const fileInput     = document.getElementById('file-input');
+const btnRef1       = document.getElementById('btn-ref1');
+const btnRef2       = document.getElementById('btn-ref2');
+const btnTeamA      = document.getElementById('btn-team-a');
+const btnTeamB      = document.getElementById('btn-team-b');
+const btnProject    = document.getElementById('btn-project');
+const btnUndo       = document.getElementById('btn-undo');
+const btnResetRefs  = document.getElementById('btn-reset-refs');
+const btnDownload   = document.getElementById('btn-download');
+
+// ── State ──────────────────────────────────────────────────────────────
+let img = null;
+let scale = 1; // canvas logical px per image px (always 1 — we draw at native res)
+
+// Reference lines: {x1,y1,x2,y2} in canvas (= image) coordinates
+let refLine1 = null;
+let refLine2 = null;
+let vp = null; // {x, y} or null if parallel
+
+// Offside lines: [{team:'A'|'B', px, py, projLine1?, projLine2?}] — click point; line drawn at render
+let offsideLines = [];
+
+// In-progress projection lines (before intersection is confirmed)
+let projLine1 = null;
+let projLine2 = null;
+
+// Interaction state
+let mode = 'idle'; // 'idle' | 'ref1' | 'ref2' | 'offside' | 'proj1' | 'proj2'
+let currentTeam = 'A';
+let dragging = false;
+let dragStart = null;
+let dragCurrent = null;
+
+// ── Helpers ────────────────────────────────────────────────────────────
+function setStatus(msg) { status.textContent = msg; }
+
+function canvasPoint(e) {
+    const rect = canvas.getBoundingClientRect();
+    // Account for CSS scaling (canvas may be displayed smaller than its logical size)
+    const scaleX = canvas.width  / rect.width;
+    const scaleY = canvas.height / rect.height;
+    return {
+        x: (e.clientX - rect.left) * scaleX,
+        y: (e.clientY - rect.top)  * scaleY
+    };
+}
+
+function computeVP(l1, l2) {
+    const a1 = l1.y2 - l1.y1, b1 = l1.x1 - l1.x2;
+    const c1 = a1 * l1.x1 + b1 * l1.y1;
+    const a2 = l2.y2 - l2.y1, b2 = l2.x1 - l2.x2;
+    const c2 = a2 * l2.x1 + b2 * l2.y1;
+    const det = a1 * b2 - a2 * b1;
+    if (Math.abs(det) < 1e-6) return null;
+    return { x: (c1*b2 - c2*b1)/det, y: (a1*c2 - a2*c1)/det };
+}
+
+// Find the two points where the line through (px,py) toward (vx,vy) exits the canvas.
+// Returns [{x,y},{x,y}] or null.
+function lineToCanvasEdges(px, py, vx, vy) {
+    const W = canvas.width, H = canvas.height;
+    const dx = px - vx, dy = py - vy;
+    const len = Math.sqrt(dx*dx + dy*dy);
+    if (len < 0.5) return null;
+    const ux = dx/len, uy = dy/len;
+
+    const candidates = [];
+    // Each canvas edge: find t such that the parametric point (px+t*ux, py+t*uy) lands on it
+    if (Math.abs(ux) > 1e-6) {
+        candidates.push(-px / ux);
+        candidates.push((W - px) / ux);
+    }
+    if (Math.abs(uy) > 1e-6) {
+        candidates.push(-py / uy);
+        candidates.push((H - py) / uy);
+    }
+
+    const pts = candidates
+        .map(t => ({ x: px + t * ux, y: py + t * uy }))
+        .filter(p => p.x >= -1 && p.x <= W+1 && p.y >= -1 && p.y <= H+1);
+
+    // Deduplicate and pick two extremes
+    if (pts.length < 2) return null;
+    pts.sort((a,b) => (a.x - b.x) || (a.y - b.y));
+    return [pts[0], pts[pts.length - 1]];
+}
+
+// If VP at infinity (null), draw a vertical line at px
+function lineEndpoints(px, py) {
+    if (!vp) {
+        return [{ x: px, y: 0 }, { x: px, y: canvas.height }];
+    }
+    const pts = lineToCanvasEdges(px, py, vp.x, vp.y);
+    return pts || [{ x: px, y: 0 }, { x: px, y: canvas.height }];
+}
+
+// ── Rendering ──────────────────────────────────────────────────────────
+function render() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (!img) {
+        ctx.fillStyle = '#1e1e2e';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#585b70';
+        ctx.font = '20px system-ui';
+        ctx.textAlign = 'center';
+        ctx.fillText('Click "Load Image" to begin', canvas.width/2, canvas.height/2);
+        return;
+    }
+
+    ctx.drawImage(img, 0, 0);
+
+    // Draw existing reference lines
+    const drawRef = (line, color, label) => {
+        if (!line) return;
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.setLineDash([8, 5]);
+        ctx.beginPath();
+        ctx.moveTo(line.x1, line.y1);
+        ctx.lineTo(line.x2, line.y2);
+        ctx.stroke();
+        // Endpoint circles
+        ctx.setLineDash([]);
+        ctx.fillStyle = color;
+        [{ x: line.x1, y: line.y1 }, { x: line.x2, y: line.y2 }].forEach(p => {
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, 5, 0, Math.PI*2);
+            ctx.fill();
+        });
+        // Label
+        ctx.fillStyle = color;
+        ctx.font = 'bold 13px system-ui';
+        ctx.textAlign = 'left';
+        ctx.fillText(label, line.x1 + 8, line.y1 - 8);
+        ctx.restore();
+    };
+    drawRef(refLine1, '#00cfff', 'Ref 1');
+    drawRef(refLine2, '#00ff99', 'Ref 2');
+
+    // Draw in-progress drag line
+    if (dragging && dragStart && dragCurrent) {
+        const color = mode === 'ref1' ? '#00cfff'
+                    : mode === 'ref2' ? '#00ff99'
+                    : mode === 'proj1' ? '#ff9900'
+                    : '#cc44ff';
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.setLineDash([8, 5]);
+        ctx.globalAlpha = 0.7;
+        ctx.beginPath();
+        ctx.moveTo(dragStart.x, dragStart.y);
+        ctx.lineTo(dragCurrent.x, dragCurrent.y);
+        ctx.stroke();
+        // Show live intersection when dragging proj2 and proj1 exists
+        if (mode === 'proj2' && projLine1) {
+            const liveLine = { x1: dragStart.x, y1: dragStart.y, x2: dragCurrent.x, y2: dragCurrent.y };
+            const ix = computeVP(projLine1, liveLine);
+            if (ix) {
+                ctx.setLineDash([]);
+                ctx.globalAlpha = 1;
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 1.5;
+                ctx.beginPath();
+                ctx.arc(ix.x, ix.y, 7, 0, Math.PI*2);
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.moveTo(ix.x - 10, ix.y); ctx.lineTo(ix.x + 10, ix.y);
+                ctx.moveTo(ix.x, ix.y - 10); ctx.lineTo(ix.x, ix.y + 10);
+                ctx.stroke();
+            }
+        }
+        ctx.restore();
+    }
+
+    // Draw committed projection lines stored with offside lines
+    offsideLines.forEach(({ projLine1: pl1, projLine2: pl2 }) => {
+        if (!pl1 || !pl2) return;
+        ctx.save();
+        ctx.globalAlpha = 0.45;
+        ctx.setLineDash([6, 4]);
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = '#ff9900';
+        ctx.beginPath(); ctx.moveTo(pl1.x1, pl1.y1); ctx.lineTo(pl1.x2, pl1.y2); ctx.stroke();
+        ctx.strokeStyle = '#cc44ff';
+        ctx.beginPath(); ctx.moveTo(pl2.x1, pl2.y1); ctx.lineTo(pl2.x2, pl2.y2); ctx.stroke();
+        ctx.restore();
+    });
+
+    // Draw in-progress proj1 line (before proj2 is drawn)
+    if (projLine1 && mode === 'proj2') {
+        ctx.save();
+        ctx.strokeStyle = '#ff9900';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([6, 4]);
+        ctx.globalAlpha = 0.7;
+        ctx.beginPath(); ctx.moveTo(projLine1.x1, projLine1.y1); ctx.lineTo(projLine1.x2, projLine1.y2); ctx.stroke();
+        ctx.restore();
+    }
+
+    // Draw vanishing point (if on-canvas)
+    if (vp) {
+        const onCanvas = vp.x >= -200 && vp.x <= canvas.width+200 &&
+                         vp.y >= -200 && vp.y <= canvas.height+200;
+        if (onCanvas) {
+            ctx.save();
+            ctx.strokeStyle = '#f5c2e7';
+            ctx.lineWidth = 2;
+            const s = 10;
+            ctx.beginPath();
+            ctx.moveTo(vp.x - s, vp.y); ctx.lineTo(vp.x + s, vp.y);
+            ctx.moveTo(vp.x, vp.y - s); ctx.lineTo(vp.x, vp.y + s);
+            ctx.stroke();
+            ctx.fillStyle = '#f5c2e7';
+            ctx.font = '12px system-ui';
+            ctx.textAlign = 'left';
+            ctx.fillText('VP', vp.x + 12, vp.y + 4);
+            ctx.restore();
+        }
+    }
+
+    // Draw offside lines
+    offsideLines.forEach(({ team, px, py }) => {
+        const color = team === 'A' ? '#FFD700' : '#FF4444';
+        const ends = lineEndpoints(px, py);
+        if (!ends) return;
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 3;
+        ctx.globalAlpha = 0.80;
+        ctx.beginPath();
+        ctx.moveTo(ends[0].x, ends[0].y);
+        ctx.lineTo(ends[1].x, ends[1].y);
+        ctx.stroke();
+        // dot at clicked point
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(px, py, 5, 0, Math.PI*2);
+        ctx.fill();
+        ctx.restore();
+    });
+}
+
+// ── Button enable/disable helpers ──────────────────────────────────────
+function updateUI() {
+    const hasImage = !!img;
+    const hasVP    = !!refLine1 && !!refLine2;
+
+    btnRef1.disabled    = !hasImage;
+    btnRef2.disabled    = !hasImage || !refLine1;
+    btnTeamA.disabled   = !hasVP;
+    btnTeamB.disabled   = !hasVP;
+    btnProject.disabled = !hasVP;
+    btnUndo.disabled    = offsideLines.length === 0 && !refLine2 && !refLine1 && !projLine1;
+    btnResetRefs.disabled = !refLine1 && !refLine2;
+    btnDownload.disabled  = !hasImage;
+
+    btnRef1.classList.toggle('active', mode === 'ref1');
+    btnRef2.classList.toggle('active', mode === 'ref2');
+    btnTeamA.classList.toggle('active', mode === 'offside' && currentTeam === 'A');
+    btnTeamB.classList.toggle('active', mode === 'offside' && currentTeam === 'B');
+    btnProject.classList.toggle('active', mode === 'proj1' || mode === 'proj2');
+}
+
+// ── Load image ─────────────────────────────────────────────────────────
+btnLoad.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => {
+    const file = fileInput.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = e => {
+        const image = new Image();
+        image.onload = () => {
+            img = image;
+            canvas.width  = img.naturalWidth;
+            canvas.height = img.naturalHeight;
+            canvas.classList.remove('no-image');
+            refLine1 = refLine2 = vp = null;
+            offsideLines = [];
+            mode = 'ref1';
+            setStatus('Step 1 — Drag along a pitch marking that runs across the field (goal line, box line, etc.) to draw Reference Line 1.');
+            updateUI();
+            render();
+        };
+        image.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+    fileInput.value = '';
+});
+
+// ── Toolbar buttons ────────────────────────────────────────────────────
+btnRef1.addEventListener('click', () => {
+    mode = 'ref1';
+    setStatus('Drag along a pitch marking that runs across the field (goal line, box line, etc.) for Reference Line 1.');
+    updateUI();
+});
+btnRef2.addEventListener('click', () => {
+    if (!refLine1) { setStatus('Draw Reference Line 1 first.'); return; }
+    mode = 'ref2';
+    setStatus('Drag along a second parallel pitch marking for Reference Line 2.');
+    updateUI();
+});
+btnTeamA.addEventListener('click', () => {
+    currentTeam = 'A'; mode = 'offside';
+    setStatus('Team A — Click on the pitch at the second-last defender\'s position to place an offside line.');
+    updateUI();
+});
+btnTeamB.addEventListener('click', () => {
+    currentTeam = 'B'; mode = 'offside';
+    setStatus('Team B — Click on the pitch at the second-last defender\'s position to place an offside line.');
+    updateUI();
+});
+btnProject.addEventListener('click', () => {
+    projLine1 = projLine2 = null;
+    mode = 'proj1';
+    setStatus(`Team ${currentTeam} — Projection: drag Line A through the body part (e.g. from the VP through a shoulder).`);
+    updateUI();
+});
+
+btnUndo.addEventListener('click', () => {
+    if (mode === 'proj2' && projLine1) {
+        projLine1 = null; mode = 'proj1';
+        setStatus(`Team ${currentTeam} — Projection: drag Line A through the body part.`);
+    } else if (offsideLines.length > 0) {
+        offsideLines.pop();
+    } else if (refLine2) {
+        refLine2 = null; vp = null;
+        mode = 'ref2';
+        setStatus('Drag along a second parallel pitch marking for Reference Line 2.');
+    } else if (refLine1) {
+        refLine1 = null;
+        mode = 'ref1';
+        setStatus('Drag along a pitch marking for Reference Line 1.');
+    }
+    updateUI();
+    render();
+});
+
+btnResetRefs.addEventListener('click', () => {
+    refLine1 = refLine2 = vp = null;
+    projLine1 = projLine2 = null;
+    offsideLines = [];
+    mode = 'ref1';
+    setStatus('Reference lines reset. Drag along a pitch marking for Reference Line 1.');
+    updateUI();
+    render();
+});
+
+btnDownload.addEventListener('click', () => {
+    if (!img) return;
+    const link = document.createElement('a');
+    link.download = 'offside-lines.png';
+    link.href = canvas.toDataURL('image/png');
+    link.click();
+});
+
+// ── Canvas mouse events ────────────────────────────────────────────────
+canvas.addEventListener('mousedown', e => {
+    if (!img) return;
+    if (mode !== 'ref1' && mode !== 'ref2' && mode !== 'proj1' && mode !== 'proj2') return;
+    dragging = true;
+    dragStart = canvasPoint(e);
+    dragCurrent = { ...dragStart };
+    e.preventDefault();
+});
+
+canvas.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    dragCurrent = canvasPoint(e);
+    render();
+});
+
+canvas.addEventListener('mouseup', e => {
+    if (!dragging) return;
+    dragging = false;
+    const end = canvasPoint(e);
+    const dx = end.x - dragStart.x, dy = end.y - dragStart.y;
+    // Require a minimum drag length to avoid accidental tiny lines
+    if (Math.sqrt(dx*dx + dy*dy) < 10) {
+        dragStart = dragCurrent = null;
+        render();
+        return;
+    }
+
+    const line = { x1: dragStart.x, y1: dragStart.y, x2: end.x, y2: end.y };
+    dragStart = dragCurrent = null;
+
+    if (mode === 'ref1') {
+        refLine1 = line;
+        if (refLine2) {
+            vp = computeVP(refLine1, refLine2);
+            mode = 'offside';
+            setStatus(vp
+                ? `Vanishing point set${isVPOnCanvas() ? ' (visible on image)' : ' (off-screen)'}. Select a team and click the pitch to place offside lines.`
+                : 'Lines appear parallel — offside lines will be drawn vertically. Select a team and click to place offside lines.');
+        } else {
+            mode = 'ref2';
+            setStatus('Good! Now drag along a second parallel pitch marking for Reference Line 2.');
+        }
+    } else if (mode === 'ref2') {
+        refLine2 = line;
+        vp = computeVP(refLine1, refLine2);
+        mode = 'offside';
+        setStatus(vp
+            ? `Vanishing point set${isVPOnCanvas() ? ' (visible on image)' : ' (off-screen)'}. Select a team and click the pitch to place offside lines.`
+            : 'Lines appear parallel — offside lines will be drawn vertically. Select a team and click to place offside lines.');
+    } else if (mode === 'proj1') {
+        projLine1 = line;
+        mode = 'proj2';
+        setStatus(`Team ${currentTeam} — Projection: drag Line B to intersect Line A (e.g. along a depth line through a defender's foot).`);
+    } else if (mode === 'proj2') {
+        projLine2 = line;
+        const intersection = computeVP(projLine1, projLine2);
+        if (intersection) {
+            offsideLines.push({ team: currentTeam, px: intersection.x, py: intersection.y, projLine1, projLine2 });
+            setStatus(`Team ${currentTeam} — Projected point placed. Draw another projection or switch mode.`);
+        } else {
+            setStatus('Lines are parallel — no intersection found. Try again with crossing lines.');
+        }
+        // Reset for the next projection
+        projLine1 = projLine2 = null;
+        mode = 'proj1';
+    }
+
+    updateUI();
+    render();
+});
+
+canvas.addEventListener('mouseleave', () => {
+    if (dragging) {
+        dragging = false;
+        dragStart = dragCurrent = null;
+        render();
+    }
+});
+
+// Click to place offside line
+canvas.addEventListener('click', e => {
+    if (mode !== 'offside') return;
+    if (!refLine1 || !refLine2) return;
+    const pt = canvasPoint(e);
+    offsideLines.push({ team: currentTeam, px: pt.x, py: pt.y });
+    updateUI();
+    render();
+});
+
+// Touch support (basic)
+canvas.addEventListener('touchstart', e => {
+    if (!img || (mode !== 'ref1' && mode !== 'ref2' && mode !== 'proj1' && mode !== 'proj2')) return;
+    const t = e.touches[0];
+    dragging = true;
+    dragStart = canvasPoint(t);
+    dragCurrent = { ...dragStart };
+    e.preventDefault();
+}, { passive: false });
+
+canvas.addEventListener('touchmove', e => {
+    if (!dragging) return;
+    dragCurrent = canvasPoint(e.touches[0]);
+    render();
+    e.preventDefault();
+}, { passive: false });
+
+canvas.addEventListener('touchend', e => {
+    if (!dragging) return;
+    const fakeEvent = { clientX: e.changedTouches[0].clientX, clientY: e.changedTouches[0].clientY };
+    canvas.dispatchEvent(new MouseEvent('mouseup', fakeEvent));
+});
+
+function isVPOnCanvas() {
+    if (!vp) return false;
+    return vp.x >= 0 && vp.x <= canvas.width && vp.y >= 0 && vp.y <= canvas.height;
+}
+
+// Initial empty canvas
+canvas.width = 800; canvas.height = 450;
+render();
+updateUI();
+</script>
