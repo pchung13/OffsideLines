@@ -4,5 +4,5 @@ obj/
 .vs/
 *.suo
 .idea/
-wwwroot/lib/
+**/wwwroot/lib/
 appsettings.Development.json
